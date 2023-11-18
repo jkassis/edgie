@@ -4,6 +4,6 @@
 .env
 .local
 .project
-__debug_bin
+__debug_bin**
 server
 

@@ -11,12 +11,12 @@
       "program": "${workspaceFolder}/main.go",
       "mode": "debug",
       "env": {
-        "DOWNLOAD_CACHE_DIR": "/tmp/edgie/download",
+        "CACHE_DOWNLOAD_DIR": "/tmp/edgie/download",
         "LOG_LEVEL": "info",
         "PORT": "8080",
         "S3_BUCKET": "farmgoods",
-        "S3_REGION": "us-west-2",
-        "UPLOAD_CACHE_DIR": "/tmp/edgie/upload",
+        "AWS_REGION": "us-west-2",
+        "CACHE_UPLOAD_DIR": "/tmp/edgie/upload",
       },
     }
   ]
