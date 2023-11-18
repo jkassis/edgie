@@ -1,14 +1,13 @@
 package service
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -148,7 +147,7 @@ type Service struct {
 	Cache *common.FileCache
 }
 
-// startUploadSync synchronizes files from the upload directory to S3 and moves them to the serving directory.
+// Start synchronizes files from the upload directory to S3 and moves them to the serving directory.
 func (s *Service) Start() error {
 	if err := s.Cache.Start(); err != nil {
 		return fmt.Errorf("failed to start cache: %v", err)
@@ -158,117 +157,123 @@ func (s *Service) Start() error {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	go s.S3SyncOnTickForever()
+	go s.S3SyncForever()
 
 	return nil
 }
 
-func (s *Service) S3SyncOnTickForever() error {
+func (s *Service) S3SyncForever() error {
 	for {
 		time.Sleep(s.Conf.SyncDelay)
-		err := s.UploadsSyncToS3()
+		err := s.S3SyncOnce()
 		if err != nil {
 			log.Error(err)
 		}
 	}
 }
 
-func (s *Service) UploadsSyncToS3() error {
-	files, err := filepath.Glob(filepath.Join(s.Conf.UploadDir, "**"))
+func (s *Service) S3SyncOnce() error {
+	srcPaths, err := filepath.Glob(filepath.Join(s.Conf.UploadDir, "**"))
 	if err != nil {
 		err = fmt.Errorf("could not read upload directory: %v", err)
 		return err
 	}
 
-	var s3Client *s3.S3
-	if len(files) > 0 {
-		sess, _ := common.AWSSessionGet(s.Conf.S3.Region)
-		s3Client = s3.New(sess, aws.NewConfig().WithRegion(s.Conf.S3.Region))
+	if len(srcPaths) == 0 {
+		return nil
 	}
 
-	for _, file := range files {
-		fileName := filepath.Base(file)
-		fileKey := filepath.Join(s.Conf.CacheDir, fileName)
+	sess, _ := common.AWSSessionGet(s.Conf.S3.Region)
+	s3Client := s3.New(sess, aws.NewConfig().WithRegion(s.Conf.S3.Region))
+
+	for _, srcPath := range srcPaths {
+		dstPath, err := filepath.Rel(s.Conf.CacheDir, srcPath)
+		if err != nil {
+			return fmt.Errorf("could not get relative path for cachefile: %s", srcPath)
+		}
 
 		// Upload file to S3
-		err := common.S3FileUpload(s3Client, file, s.Conf.S3.Bucket, fileKey)
-		if err != nil {
+		if err = common.S3FileUpload(s3Client, srcPath, s.Conf.S3.Bucket, dstPath); err != nil {
 			return fmt.Errorf("s3 upload failed: %v", err)
 		}
 
-		// Remove from uploads in insert into cache
-		newFilePath := filepath.Join(s.Conf.CacheDir, fileName)
-		err = os.Rename(file, newFilePath)
+		// remove from uploads
+		err = os.Remove(srcPath)
 		if err != nil {
-			return fmt.Errorf("cache insert failed: %v", err)
+			return fmt.Errorf("failed to remove file from uploads: %v", err)
 		}
 	}
 
 	return nil
 }
 
-func (s *Service) Download(w http.ResponseWriter, r *http.Request) {
-	downloadPath := filepath.Clean(s.Conf.CacheDir + r.URL.Path)
-	fileInfo, err := os.Stat(downloadPath)
-	if os.IsNotExist(err) {
-		sess, _ := common.AWSSessionGet(s.Conf.S3.Region)
-		s3Client := s3.New(sess, aws.NewConfig().WithRegion(s.Conf.S3.Region))
-		err = common.S3FileDownload(w, r, downloadPath, s.Conf.S3.Bucket, s3Client)
-		if err != nil {
-			if strings.HasPrefix(err.Error(), common.S3ErrorPrefix) {
-				http.NotFound(w, r)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+func (s *Service) Download(srcPath string) (fileReader io.Reader, err error) {
+	srcPath = filepath.Clean(srcPath)
+
+	var fce *common.FileCacheEntry
+
+	// check the cache first...
+	fce, err = s.Cache.Get(srcPath)
+
+	// not in cache... check the upload folder
+	if err == os.ErrNotExist {
+		uploadFilePath := filepath.Clean(s.Conf.UploadDir + "/" + srcPath)
+		if _, err = os.Stat(uploadFilePath); err == nil {
+			var data []byte
+			if data, err = os.ReadFile(uploadFilePath); err == nil {
+				// found it... cache it
+				fce, err = s.Cache.Put(srcPath, bytes.NewReader(data))
 			}
 		}
-		fileInfo, err = os.Stat(downloadPath)
 	}
 
-	if err != nil {
-		err = fmt.Errorf("could not stat %s", downloadPath)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else {
-		// Increment download counter and record file size
-		downloadCounter.Inc()
-		downloadSizeHistogram.Observe(float64(fileInfo.Size()))
-		http.ServeFile(w, r, downloadPath)
+	// not in upload folder... check aws...
+	if err == os.ErrNotExist {
+		sess, _ := common.AWSSessionGet(s.Conf.S3.Region)
+		s3Client := s3.New(sess, aws.NewConfig().WithRegion(s.Conf.S3.Region))
+		var s3Reader io.ReadCloser
+		if s3Reader, err = common.S3FileDownload(srcPath, s.Conf.S3.Bucket, s3Client); err == nil {
+			// found it... cache it
+			fce, err = s.Cache.Put(srcPath, s3Reader)
+			s3Reader.Close()
+		}
 	}
+
+	// still have a problem?
+	if err != nil {
+		return nil, err
+	}
+
+	// Increment download counter and record file size
+	downloadCounter.Inc()
+	downloadSizeHistogram.Observe(float64(fce.Size))
+	return bytes.NewReader(fce.Data), nil
 }
 
-func (s *Service) Upload(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+func (s *Service) Upload(filePath string, srcR io.Reader) error {
+	dstPath := filepath.Clean(s.Conf.UploadDir + "/" + filePath)
+	dstDir := path.Dir(dstPath)
 
-	uploadPath := filepath.Clean(s.Conf.UploadDir + "/" + r.URL.Path)
-	uploadDir := path.Dir(uploadPath)
-
-	// make the upload dir
-	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
-		err = fmt.Errorf("failed to create directory %s: %v", uploadDir, err)
-		log.Error(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// make the uploadFileDir
+	if err := os.MkdirAll(dstDir, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create directory %s: %v", dstDir, err)
 	}
 
-	// make the upload path
-	dst, err := os.Create(uploadPath)
+	// make the dstPath
+	dstW, err := os.Create(dstPath)
 	if err != nil {
-		err = fmt.Errorf("failed to create the upload file %s: %v", uploadPath, err)
-		log.Error(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return fmt.Errorf("failed to create the upload file %s: %v", dstPath, err)
 	}
-	defer dst.Close()
+	defer dstW.Close()
 
 	// copy from Body to dst file
-	fileSize, err := io.Copy(dst, r.Body)
+	dstSize, err := io.Copy(dstW, srcR)
 	if err != nil {
-		err = fmt.Errorf("filed to write to file %s: %v", uploadPath, err)
-		log.Error(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return fmt.Errorf("filed to write to file %s: %v", dstPath, err)
 	}
 
 	uploadCounter.Inc()
-	uploadSizeHistogram.Observe(float64(fileSize))
-	fmt.Fprintf(w, "File uploaded successfully: %s", r.URL.Path)
+	uploadSizeHistogram.Observe(float64(dstSize))
+	log.Printf("File uploaded successfully: %s", filePath)
+	return nil
 }

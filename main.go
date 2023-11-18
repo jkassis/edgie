@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"path/filepath"
 
 	"github.com/jkassis/edgie/common"
 	"github.com/jkassis/edgie/service"
@@ -32,9 +33,12 @@ func cmdExecute(cmd *cobra.Command, args []string) {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
-			s.Download(w, r)
+			path := filepath.Clean(r.URL.Path)
+			s.Download(path)
 		} else if r.Method == "POST" {
-			s.Upload(w, r)
+			path := filepath.Clean(r.URL.Path)
+			s.Download(path)
+			s.Upload(path, r.Body)
 		} else {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return

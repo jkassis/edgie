@@ -1,7 +1,6 @@
 package common
 
 import (
-	"bytes"
 	"container/list"
 	"fmt"
 	"io"
@@ -84,7 +83,7 @@ func init() {
 		evictionRAMCounter)
 }
 
-type fileCacheEntry struct {
+type FileCacheEntry struct {
 	Data     []byte
 	InMemory bool
 	Mutex    sync.Mutex
@@ -92,7 +91,7 @@ type fileCacheEntry struct {
 }
 
 type FileCache struct {
-	index           *xsync.MapOf[string, *fileCacheEntry]
+	index           *xsync.MapOf[string, *FileCacheEntry]
 	config          FileCacheConfig
 	evictionTicker  *time.Ticker
 	mruList         *list.List
@@ -104,7 +103,7 @@ type FileCache struct {
 
 func NewFileCache(config FileCacheConfig) *FileCache {
 	fc := &FileCache{
-		index:          xsync.NewMapOf[*fileCacheEntry](),
+		index:          xsync.NewMapOf[*FileCacheEntry](),
 		config:         config,
 		evictionTicker: time.NewTicker(config.EvictionTick),
 		mruList:        list.New(),
@@ -142,7 +141,7 @@ func (fc *FileCache) init() error {
 
 		if !info.IsDir() {
 			fileName := filepath.Base(file)
-			entry := &fileCacheEntry{
+			entry := &FileCacheEntry{
 				Data:     nil,
 				Size:     info.Size(),
 				InMemory: false,
@@ -156,19 +155,20 @@ func (fc *FileCache) init() error {
 	return nil
 }
 
-func (fc *FileCache) Read(filePath string) (io.Reader, error) {
-	entry, ok := fc.index.Load(filePath)
+func (fc *FileCache) Get(filePath string) (fce *FileCacheEntry, err error) {
+	var ok bool
+	fce, ok = fc.index.Load(filePath)
 	if !ok {
 		// it's not in the index, so we don't have it.
 		return nil, os.ErrNotExist
 	}
 
 	// lock this while we do the read...
-	entry.Mutex.Lock()
-	defer entry.Mutex.Unlock()
+	fce.Mutex.Lock()
+	defer fce.Mutex.Unlock()
 
 	// because if its not in memory, we must modify it...
-	if !entry.InMemory {
+	if !fce.InMemory {
 		cacheReadsDisk.Inc()
 
 		data, err := os.ReadFile(filepath.Join(fc.config.DirPath, filePath))
@@ -176,8 +176,8 @@ func (fc *FileCache) Read(filePath string) (io.Reader, error) {
 			return nil, err
 		}
 
-		entry.Data = data
-		entry.InMemory = true
+		fce.Data = data
+		fce.InMemory = true
 
 		fc.mutex.Lock()
 		fc.usedMemoryBytes += int64(len(data))
@@ -191,54 +191,55 @@ func (fc *FileCache) Read(filePath string) (io.Reader, error) {
 		fc.updateMRU(filePath)
 		fc.mutex.Unlock()
 	}
-	return bytes.NewReader(entry.Data), nil
+	return fce, nil
 }
 
-func (fc *FileCache) Write(fileName string, in io.Reader) error {
+func (fc *FileCache) Put(filePath string, in io.Reader) (fce *FileCacheEntry, err error) {
 	cacheWrites.Inc()
 
 	// get or create the index entry atomically
 	fc.mutex.Lock()
-	var entrySizeStart int64
-	entry, ok := fc.index.Load(fileName)
+	var fceSizeStart int64
+	var ok bool
+	fce, ok = fc.index.Load(filePath)
 	if !ok {
-		entry = &fileCacheEntry{}
-		fc.index.Store(fileName, entry)
+		fce = &FileCacheEntry{}
+		fc.index.Store(filePath, fce)
 	} else {
-		entrySizeStart = entry.Size
+		fceSizeStart = fce.Size
 	}
 
 	// lock the entry and then release the cache
-	entry.Mutex.Lock()
-	defer entry.Mutex.Unlock()
+	fce.Mutex.Lock()
+	defer fce.Mutex.Unlock()
 	fc.mutex.Unlock()
 
 	// read all the data
 	data, err := io.ReadAll(in)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// write out the file
-	fullPath := filepath.Join(fc.config.DirPath, fileName)
+	fullPath := filepath.Join(fc.config.DirPath, filePath)
 	if err := os.WriteFile(fullPath, data, 0664); err != nil {
-		return err
+		return nil, err
 	}
 
 	// update the entry (this is safe cause we have the entry locked)
-	entry.Data = data
-	entry.Size = int64(len(data))
-	entry.InMemory = true
+	fce.Data = data
+	fce.Size = int64(len(data))
+	fce.InMemory = true
 
 	// lock the cache before updating stats
 	fc.mutex.Lock()
-	fc.usedMemoryBytes += entry.Size
-	fc.usedMemoryBytes -= entrySizeStart
-	fc.updateMRU(fileName)
+	fc.usedMemoryBytes += fce.Size
+	fc.usedMemoryBytes -= fceSizeStart
+	fc.updateMRU(filePath)
 	fc.updateCacheMetrics()
 	fc.mutex.Unlock()
 
-	return nil
+	return fce, nil
 }
 
 func (fc *FileCache) updateMRU(fileName string) {

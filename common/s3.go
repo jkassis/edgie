@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
-	"path"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -47,53 +45,40 @@ func S3CmdExecute(cmd *cobra.Command, args []string) *S3Conf {
 }
 
 // S3FileUpload uploads a file to an S3 bucket.
-func S3FileUpload(s3Client *s3.S3,
-	filePath string,
-	bucket string,
-	key string) error {
-	file, err := os.Open(filePath)
+func S3FileUpload(
+	s3Client *s3.S3,
+	srcPath string,
+	dstBucket string,
+	dstPath string) error {
+
+	file, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %v", err)
 	}
 	defer file.Close()
 
-	_, err = s3Client.PutObject(&s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   file,
-	})
+	_, err = s3Client.PutObject(
+		&s3.PutObjectInput{
+			Bucket: aws.String(dstBucket),
+			Key:    aws.String(dstPath),
+			Body:   file,
+		})
 
 	return err
 }
 
-func S3FileDownload(w http.ResponseWriter,
-	r *http.Request,
-	localFilePath string,
+func S3FileDownload(
+	path string,
 	bucketName string,
-	s3Client *s3.S3) (err error) {
+	s3Client *s3.S3) (rc io.ReadCloser, err error) {
 
 	resp, err := s3Client.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
-		Key:    aws.String(r.URL.Path),
+		Key:    aws.String(path),
 	})
 	if err != nil {
-		return fmt.Errorf(S3ErrorPrefix+": failed to get object from S3:%v", err)
-	}
-	defer resp.Body.Close()
-
-	if err := os.MkdirAll(path.Dir(localFilePath), os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
+		return nil, fmt.Errorf(S3ErrorPrefix+": failed to get object from S3:%v", err)
 	}
 
-	localFile, err := os.Create(localFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
-	}
-	defer localFile.Close()
-
-	if _, err := io.Copy(localFile, resp.Body); err != nil {
-		return fmt.Errorf("failed to write to file: %v", err)
-	}
-
-	return nil
+	return resp.Body, nil
 }
